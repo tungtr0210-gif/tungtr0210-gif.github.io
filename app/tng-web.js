@@ -1,6 +1,6 @@
-/* TNG Plus 2.0.1 · bản web. Tạo bởi build/build-web.js, đừng sửa tay. */
+/* TNG Plus 2.1.0 · bản web. Tạo bởi build/build-web.js, đừng sửa tay. */
 (function () {
-const WEB_VERSION = "2.0.1";
+const WEB_VERSION = "2.1.0";
 /* TNG Plus bản web · lớp giả lập vài thứ của Node để mã phần nền (src/*.js) chạy trong trình duyệt.
    build/build-web.js ghép: shims.js + các module src (bọc __def) + google-web.js + hc-web.js → tng-web.js */
 const WEB_NO = 'Bản web chưa làm được việc này. Dùng app TNG Plus trên máy tính.';
