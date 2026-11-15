@@ -1,4 +1,3 @@
-/* Mã đăng nhập Google cho bản web: Google Cloud → APIs & Services → Credentials → OAuth client ID loại "Web application",
-   Authorized JavaScript origins: https://tungtr0210-gif.github.io . Client ID công khai được (không phải Client secret).
-   Copy file này thành config.js rồi điền clientId. */
-window.TNG_WEB_CONFIG = { clientId: '' };
+/* Mã đăng nhập Google cho bản web (OAuth client "TNG Plus Web", loại Web application, project himen-content).
+   Origin cho phép: https://tungtr0210-gif.github.io . Client ID công khai được — KHÔNG để Client secret ở đây. */
+window.TNG_WEB_CONFIG = { clientId: '631718628946-2f8iqrep18rhemung178tqvt554rcv48.apps.googleusercontent.com' };
