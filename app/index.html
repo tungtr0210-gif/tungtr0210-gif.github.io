@@ -4651,7 +4651,11 @@ function v2Save(submit) {
     if (!submit) toast('Đã lưu nháp (trạng thái ' + p.status + ')');
     else if (edit && self && wasSt === 'Lỗi đăng') toast('Đã lưu thay đổi. Bài đang "Lỗi đăng": leader bấm "Thử đăng lại" ở Duyệt & đăng để đăng lại.');
     else if (edit && self && ['Chưa làm', 'Đang làm', 'Cần sửa'].indexOf(wasSt) < 0) toast('Đã lưu thay đổi.');
-    else if (p.status === 'Đã duyệt') toast('Đã đưa vào hàng chờ đăng · ' + (p.time || '') + ' ngày ' + v2DM(p.date) + '. Leader hậu kiểm sau.');
+    // 2.1: nhân viên Tự đăng đã kết nối Facebook → máy này gửi lên Facebook luôn
+    else if (p.status === 'Đã hẹn giờ') toast('Đã hẹn giờ trên Facebook từ máy của bạn · lên lúc ' + (p.scheduledAt || (p.time + ' ' + v2DM(p.date))) + '. Tắt máy vẫn đăng đúng giờ.' + (p.autoNote ? ' ' + p.autoNote : ''));
+    else if (p.status === 'Đã đăng') toast('Đã đăng lên Facebook từ máy của bạn (' + pageIdsOf(p).length + ' Page). Leader hậu kiểm sau.');
+    else if (p.status === 'Lỗi đăng') toast('Đã vào hàng chờ nhưng chưa đăng được: ' + (p.error || p.autoNote || ''), true);
+    else if (p.status === 'Đã duyệt') toast('Đã đưa vào hàng chờ đăng · ' + (p.time || '') + ' ngày ' + v2DM(p.date) + '. ' + (p.autoNote || 'Leader hậu kiểm sau.'));
     else toast(edit ? 'Đã lưu và gửi duyệt lại.' : 'Đã gửi duyệt. Người có quyền duyệt sẽ thấy bài ngay.');
   });
 }
@@ -6030,6 +6034,151 @@ ACT.closeOverlay = function (el, ev) { if (ev && ev.target === el && !v2jDownOnO
   css.textContent = '.v2j-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;border:1px solid var(--info-line, #BBD0FF);background:var(--info-bg, #EDF2FF);color:var(--info-ink, #23408E);border-radius:12px;padding:10px 14px;font-size:13.5px}' +
     '.v2sum .v2warn{display:block;margin-top:6px;color:var(--warn-ink, #7A4B00);font-weight:600}' +
     '.v2j-bar.warn{border-color:var(--warn-line, #F5D28A);background:var(--warn-bg, #FFF7E0);color:var(--warn-ink, #7A4B00)}.v2j-act{display:flex;gap:6px;align-items:center}';
+  document.head.appendChild(css);
+})();
+
+/* ======================= TNG Plus 2.1 · K. Nhân viên tự kết nối Facebook (đăng từ máy của mình) =======================
+   - Leader: Cài đặt › Kết nối tài khoản → "Cho nhân viên tự kết nối Facebook" (bật/tắt) + cài app Meta + tình trạng từng người
+   - Nhân viên: Cài đặt › Tài khoản của tôi → "Facebook của tôi": Kết nối (cửa sổ Facebook thật) / Kiểm tra lại quyền / Ngắt
+   - Viết bài: Tự đăng + đã kết nối đủ Page → bấm gửi là hẹn giờ / đăng trên Facebook từ máy đó; Cần duyệt → sau khi duyệt máy này đăng (máy leader dự phòng) */
+(function () {
+  const st = () => (S.data && S.data.settings) || {};
+  const mine = () => st().myFb || null;
+  const isLead = () => me().role === 'Leader';
+  const isSelf = () => v2Mode() === 'Tự đăng' && !isLead();
+  const pn = (id) => pageNameOf(id);
+  const reload = () => api('api_bootstrap').then(function (d) { S.data = d; renderAll(); });
+  const busy = { on: '' };
+  const btn = (act, label, cls, extra) => '<button type="button" class="btn' + (cls ? ' ' + cls : '') + '" data-act="' + act + '"' + (busy.on ? ' disabled' : '') + (extra || '') + '>' + (busy.on === act ? '<span class="spin" aria-hidden="true" style="width:14px;height:14px"></span> ' : '') + label + '</button>';
+
+  /* ---------- Cài đặt › Tài khoản của tôi (nhân viên) ---------- */
+  function fbCard() {
+    const m = mine(), share = st().fbShare;
+    const modeNote = isSelf()
+      ? '<div class="p3mode ok"><b>Chế độ của bạn: Tự đăng.</b> Bấm gửi là bài lên Facebook (hoặc hẹn giờ trên Facebook) thẳng từ máy này, không cần duyệt, không cần máy leader.</div>'
+      : '<div class="p3mode"><b>Chế độ của bạn: Cần duyệt.</b> Bài vẫn phải được duyệt. Duyệt xong, máy bạn tự gửi lên Facebook (hẹn giờ) khi đang mở app; máy leader làm dự phòng. Khi leader chuyển bạn sang Tự đăng thì dùng được ngay, không phải kết nối lại.</div>';
+    if (window.hc.isWeb) return setCard('Facebook của tôi', '<p class="hint" style="margin:0">Kết nối Facebook chỉ làm được trên app TNG Plus máy tính (Windows / Mac). Kết nối xong ở máy tính, bài viết trên web cũng được máy đó đăng.</p>');
+    if (!m) {
+      return setCard('Facebook của tôi', modeNote + '<p class="hint" style="margin:0">Kết nối nick Facebook của bạn để máy này đăng được lên các Page bạn được giao.</p>' +
+        '<div class="p3steps"><div><span>1</span><b>Leader cấp quyền đăng bài trên Page cho nick của bạn</b><em>Meta Business (BM) → Người dùng → Mọi người → giao Page, quyền "Nội dung"; hoặc Cài đặt Page → Quyền truy cập Trang.</em></div>' +
+        '<div><span>2</span><b>Leader thêm nick của bạn làm Người thử nghiệm của app Meta</b><em>Bạn vào developers.facebook.com/requests bấm Chấp nhận (app đang ở chế độ thử nghiệm).</em></div>' +
+        '<div><span>3</span><b>Bấm "Kết nối Facebook của tôi"</b><em>Cửa sổ Facebook mở ra: đăng nhập nick, bấm Cho phép. App tự lấy các Page bạn được đăng.</em></div></div>' +
+        (share ? '<div>' + btn('k3Connect', ic('ext', 16) + 'Kết nối Facebook của tôi', 'primary') + '</div>'
+          : '<div class="box info" style="margin:0">Leader chưa bật <b>Cho nhân viên tự kết nối Facebook</b> (Cài đặt › Kết nối tài khoản). Bật xong bạn bấm Tải lại.</div><div>' + btn('k3Reload', 'Tải lại') + '</div>'));
+    }
+    const want = S.data.pages.filter(function (p) { return p.enabled !== false; }).map(function (p) { return p.id; });
+    return setCard('Facebook của tôi · đã kết nối', modeNote +
+      '<div class="kv"><div><span>Nick Facebook</span><b>' + esc(m.nick || '—') + '</b></div><div><span>Kết nối lúc</span><b>' + esc(m.at) + '</b></div><div><span>Page đăng được</span><b>' + m.pages.length + ' / ' + want.length + '</b></div></div>' +
+      '<div class="p3pages">' + want.map(function (id) { const ok = m.pages.indexOf(id) >= 0; return '<div class="' + (ok ? 'ok' : 'no') + '"><span>' + (ok ? '✓' : '—') + '</span><b>' + esc(pn(id)) + '</b><em>' + (ok ? (isSelf() ? 'tự đăng từ máy này' : 'máy này đăng được (sau khi duyệt)') : 'nick chưa có quyền · máy leader đăng') + '</em></div>'; }).join('') + '</div>' +
+      '<div class="actions">' + btn('k3Recheck', 'Kiểm tra lại quyền') + btn('k3Connect', 'Đăng nhập lại') + btn('k3Off', 'Ngắt kết nối', 'danger') + '</div>' +
+      '<p class="hint" style="margin:0">Token chỉ lưu trên máy này (mã hóa). Leader gỡ quyền Page trong BM thì bấm "Kiểm tra lại quyền", app thôi đăng Page đó.</p>');
+  }
+
+  /* ---------- Cài đặt › Kết nối tài khoản (leader) ---------- */
+  function shareCard() {
+    const share = st().fbShare, ready = st().fbLeaderReady;
+    const staff = S.data.users.filter(function (u) { return u.role !== 'Leader' && !u.leftAt && u.active; });
+    const list = staff.map(function (u) {
+      const f = u.fb;
+      return '<div class="v2row" style="justify-content:space-between;gap:10px;flex-wrap:wrap"><span><b>' + esc(u.name) + '</b> <span class="hint" style="margin:0">' + esc(u.email) + ' · ' + esc(u.mode || 'Cần duyệt') + '</span></span><span class="p3st ' + (f && f.pages && f.pages.length ? 'ok' : 'no') + '">' + (f ? '✓ ' + esc(f.nick || 'đã kết nối') + ' · ' + (f.pages || []).length + ' Page' : 'chưa kết nối') + '</span></div>';
+    }).join('') || '<p class="hint" style="margin:0">Chưa có nhân viên.</p>';
+    const guide = '<details class="k3guide"><summary>Cài app Meta để nhân viên đăng nhập được (làm 1 lần)</summary><ol>' +
+      '<li>developers.facebook.com → app của bạn → <b>Use cases / Sản phẩm</b>: thêm <b>Facebook Login</b> (nếu chưa có).</li>' +
+      '<li>Facebook Login → <b>Settings</b>: bật <b>Client OAuth login</b> và <b>Embedded browser OAuth login</b>; ô <b>Valid OAuth Redirect URIs</b> thêm <code>https://www.facebook.com/connect/login_success.html</code> → Save.</li>' +
+      '<li><b>App roles → Roles</b> (Vai trò ứng dụng): <b>Add People</b> → chọn <b>Tester</b> → nhập nick Facebook của từng nhân viên. Nhân viên vào developers.facebook.com/requests bấm Chấp nhận.</li>' +
+      '<li>Trong Meta Business: giao Page cho nick nhân viên, quyền <b>Nội dung</b> (đăng bài).</li></ol></details>';
+    const body = (share
+      ? '<div class="p3mode ok"><b>Đang bật</b> · App ' + esc(share.appId) + (share.at ? ' · từ ' + esc(share.at) : '') + '. Nhân viên vào Cài đặt › Tài khoản của tôi → Kết nối Facebook của tôi. Máy nhân viên tự gửi bài lên Facebook, máy này làm dự phòng.</div>'
+      : '<div class="p3mode">Đang tắt: chỉ máy leader đăng bài. Bật để mỗi nhân viên kết nối nick Facebook của mình, đăng từ máy họ, không cần máy leader mở.</div>') +
+      '<p class="hint" style="margin:0">Bật thì App ID và App Secret của app Meta được lưu vào Sheet dự án ở dạng mã hóa; chỉ app TNG Plus của người có quyền vào Sheet mới dùng được. Token Facebook của mỗi người chỉ nằm trên máy người đó.</p>' +
+      (share ? '<div class="actions">' + btn('k3ShareOff', 'Tắt cho nhân viên tự kết nối', 'danger') + '</div>'
+        : ready ? '<div class="actions">' + btn('k3ShareOn', 'Bật cho nhân viên tự kết nối', 'primary') + '</div>' : '<div class="box info" style="margin:0">Kết nối Facebook trên máy này trước (App ID + App Secret ở ô phía trên), rồi bật.</div>') +
+      guide + '<div class="lab" style="margin-top:4px">Facebook trên máy nhân viên</div>' + list;
+    return setCard('Nhân viên tự đăng từ máy mình', body);
+  }
+
+  const k3Group0 = setGroupHtml;
+  setGroupHtml = function (g) {
+    let h = k3Group0(g);
+    if (g === 'me' && !isLead()) h += fbCard();
+    if (g === 'connect' && isLead()) h += shareCard();
+    if (g === 'people' && isLead()) {
+      S.data.users.forEach(function (u) {
+        if (u.role === 'Leader') return;
+        const f = u.fb;
+        const s = f ? '<div class="p3st ok">✓ FB trên máy: ' + esc(f.nick || '') + ' · ' + (f.pages || []).length + ' Page</div>' : '<div class="p3st no">FB trên máy: chưa kết nối' + (u.mode === 'Tự đăng' ? ' · máy leader đăng thay' : '') + '</div>';
+        h = h.replace('data-act="v2UMode" data-email="' + esc(u.email) + '" data-v="Tự đăng">Tự đăng</button></div>', 'data-act="v2UMode" data-email="' + esc(u.email) + '" data-v="Tự đăng">Tự đăng</button></div>' + s);
+      });
+    }
+    return h;
+  };
+
+  /* ---------- thao tác ---------- */
+  function go(act, p, ok) {
+    busy.on = act; renderAll();
+    return p.then(function (r) { busy.on = ''; return reload().then(function () { if (ok) toast(typeof ok === 'function' ? ok(r) : ok); }); })
+      .catch(function (e) { busy.on = ''; renderAll(); toast(e.message || String(e), true); });
+  }
+  const resMsg = function (r) {
+    if (!r || !r.connected) return 'Đã kết nối.';
+    const n = r.pages.length, miss = (r.missing || []).length;
+    return n ? 'Đã kết nối Facebook (' + (r.nick || 'nick của bạn') + ') · ' + n + ' Page máy này đăng được' + (miss ? ', còn ' + miss + ' Page nick chưa có quyền.' : '.') : 'Đã kết nối nhưng nick chưa có quyền đăng Page nào của dự án. Nhờ leader giao Page trong Meta Business rồi bấm "Kiểm tra lại quyền".';
+  };
+  ACT.k3Connect = function () {
+    const share = st().fbShare;
+    if (!share) { toast('Leader chưa bật cho nhân viên tự kết nối Facebook.', true); return; }
+    go('k3Connect', window.hc.fbLogin(share.appId, st().fbScopes || '').then(function (r) {
+      if (!r || !r.ok) throw new Error((r && r.error) || 'Chưa đăng nhập được Facebook.');
+      return api('api_myFbConnect', r.token);
+    }), resMsg);
+  };
+  ACT.k3Recheck = function () { go('k3Recheck', api('api_myFbRecheck'), resMsg); };
+  ACT.k3Off = function () { if (!confirm('Ngắt Facebook trên máy này? Bài của bạn sẽ do máy leader đăng.')) return; go('k3Off', api('api_myFbOff'), 'Đã ngắt kết nối. Bài của bạn quay về hàng chờ máy leader.'); };
+  ACT.k3Reload = function () { go('k3Reload', Promise.resolve(), ''); };
+  ACT.k3ShareOn = function () { go('k3ShareOn', api('api_fbShare', true), 'Đã bật. Nhân viên vào Cài đặt › Tài khoản của tôi → Kết nối Facebook của tôi.'); };
+  ACT.k3ShareOff = function () { if (!confirm('Tắt cho nhân viên tự kết nối? Máy đã kết nối vẫn giữ token cho tới khi ngắt; kết nối mới sẽ không làm được.')) return; go('k3ShareOff', api('api_fbShare', false), 'Đã tắt cho nhân viên tự kết nối Facebook.'); };
+
+  /* ---------- khung viết bài: cho biết bài sẽ được đăng từ đâu ---------- */
+  function direct(e) {
+    const m = mine(); if (!m || isLead()) return null;
+    const ids = pageIdsOf(e);
+    return { m: m, ids: ids, ok: ids.filter(function (id) { return m.pages.indexOf(id) >= 0; }), no: ids.filter(function (id) { return m.pages.indexOf(id) < 0; }) };
+  }
+  const k3Sum0 = v2Summary;
+  v2Summary = function (e) {
+    let h = k3Sum0(e);
+    if (isLead() || v2IsManualFmt(e) || (e.publishMode || 'schedule') === 'manual') return h;
+    const d = direct(e), self = v2AuthorMode(e) === 'Tự đăng';
+    if (self && d && d.ids.length && !d.no.length) h = h.replace(/Vào hàng chờ, đăng ngay lên Facebook \(app leader đăng trong vòng 5 phút\)/, 'Gửi là đăng ngay lên Facebook').replace(/Vào hàng chờ, tự hẹn giờ đăng /, 'Gửi là hẹn giờ trên Facebook ').replace(' (bài vào thẳng hàng chờ, nhớ thêm trước giờ đăng)', '');
+    if (d && d.ids.length) {
+      if (d.no.length) h += '<span class="p3line no">⚠ Nick ' + esc(d.m.nick || 'của bạn') + ' chưa có quyền ' + d.no.map(pn).map(esc).join(', ') + ' → ' + (self ? 'cả bài vào hàng chờ, máy leader đăng.' : 'sau khi duyệt, máy leader đăng.') + '</span>';
+      else h += self ? '<span class="p3line ok">✓ Đăng từ máy bạn bằng nick ' + esc(d.m.nick || '') + ' · không cần duyệt, không cần máy leader.</span>' : '<span class="p3line ok">✓ Sau khi duyệt: máy bạn (đang mở app) hoặc máy leader gửi lên Facebook.</span>';
+    } else if (self && !mine() && !window.hc.isWeb) h += '<span class="p3line no">Chưa kết nối Facebook trên máy này → bài vào hàng chờ, máy leader đăng. Kết nối ở Cài đặt › Tài khoản của tôi.</span>';
+    return h;
+  };
+  const k3Ed0 = v2EditorHtml;
+  v2EditorHtml = function () {
+    let h = k3Ed0();
+    const e = S.editing;
+    if (!e || isLead() || v2AuthorMode(e) !== 'Tự đăng') return h;
+    h = h.replace('<b>Tự đăng theo lịch khi được duyệt</b><span>Duyệt xong, bài tự hẹn giờ lên Facebook đúng ngày giờ ở trên. Giờ đã qua thì đăng ngay.</span>', '<b>Tự đăng theo lịch</b><span>Gửi xong, bài tự hẹn giờ lên Facebook đúng ngày giờ ở trên. Giờ đã qua thì đăng ngay.</span>')
+      .replace('<b>Duyệt xong đăng ngay</b><span>Duyệt xong bài lên Facebook luôn, bỏ qua ngày giờ ở trên.</span>', '<b>Đăng ngay khi gửi</b><span>Bấm gửi là bài lên Facebook luôn, bỏ qua ngày giờ ở trên.</span>')
+      .replace('<b>Leader tự bấm đăng</b><span>Duyệt xong bài nằm ở "Đã duyệt, chờ đăng" để leader chọn lúc đăng.</span>', '<b>Để leader bấm đăng</b><span>Bài nằm ở "Đã duyệt, chờ đăng", leader chọn lúc đăng.</span>')
+      .replace('<div class="lab" style="margin-top:6px">Sau khi được duyệt</div>', '<div class="lab" style="margin-top:6px">Khi bấm gửi</div>');
+    const d = direct(e);
+    if (d && d.ids.length && !d.no.length && (e.publishMode || 'schedule') !== 'manual' && !v2IsManualFmt(e)) h = h.replace(/(id="v2-submit"[^>]*>)([\s\S]*?)(<\/button>)/, function (all, a, b, c) { return a + b.replace(/Đưa vào hàng chờ đăng/, e.publishMode === 'now' ? 'Đăng ngay lên Facebook' : 'Hẹn giờ trên Facebook') + c; });
+    return h;
+  };
+
+  const css = document.createElement('style');
+  css.textContent =
+    '.p3steps{display:flex;flex-direction:column;gap:8px}.p3steps>div{display:grid;grid-template-columns:26px 1fr;column-gap:10px;row-gap:2px;align-items:start}.p3steps span{grid-row:span 2;width:24px;height:24px;border-radius:50%;background:var(--accent);color:#fff;font-weight:700;font-size:12.5px;display:flex;align-items:center;justify-content:center}.p3steps em{font-style:normal;color:var(--ink3);font-size:12.5px}' +
+    '.p3pages{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:10px;overflow:hidden}.p3pages>div{display:grid;grid-template-columns:22px 1fr auto;gap:8px;align-items:center;padding:8px 12px;border-top:1px solid var(--line)}.p3pages>div:first-child{border-top:0}.p3pages .ok span{color:var(--ok-ink,#1E8E4A);font-weight:700}.p3pages .no{opacity:.7}.p3pages em{font-style:normal;font-size:12px;color:var(--ink3)}' +
+    '.p3mode{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--soft);font-size:13px;line-height:1.5}.p3mode.ok{border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}' +
+    '.p3st{font-size:11.5px;margin-top:4px;font-weight:600}.p3st.ok{color:var(--ok-ink,#1E8E4A)}.p3st.no{color:var(--ink3)}' +
+    '.p3line{display:block;margin-top:6px;font-weight:600}.p3line.ok{color:var(--ok-ink,#1E8E4A)}.p3line.no{color:var(--warn-ink,#7A4B00)}' +
+    '.k3guide{border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:13px}.k3guide summary{cursor:pointer;font-weight:600}.k3guide ol{margin:8px 0 0;padding-left:20px;display:flex;flex-direction:column;gap:6px}.k3guide code{font-size:12px;word-break:break-all}' +
+    'html[data-theme=dark] .v2opt.on{background:color-mix(in srgb,var(--accent) 16%,var(--panel))}.v2opt.on b{color:var(--ink)}.v2opt.on span{color:var(--ink2)}';
   document.head.appendChild(css);
 })();
 

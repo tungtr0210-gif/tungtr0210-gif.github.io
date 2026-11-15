@@ -421,6 +421,7 @@ __def("core", function (module, exports, require) {
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { ST, STATUSES, ROLE, OPTIONS, EDITABLE, POST_COLS, POST_HEADERS } = require('./constants');
 const { fmt, stampId, parseThaiTime, parseStamp, parseJson } = require('./util');
 
@@ -443,6 +444,26 @@ module.exports = function createCore(deps) {
     if (!t) throw new Error('Máy này chưa có token của Page ' + pageId + '. Leader vào Cài đặt → Kết nối Facebook trên máy này.');
     return t;
   }
+  /* 2.1 · nhân viên tự kết nối Facebook: leader bật chia sẻ → App ID + App Secret (mã hóa AES-256-GCM) nằm ở APP_CAI_DAT 'fbApp'.
+     Máy nhân viên dùng để đổi token đăng nhập Facebook sang token dài hạn; token Page chỉ lưu trên máy đó (mã hóa của hệ điều hành). */
+  const FB_SCOPES = 'pages_show_list,pages_read_engagement,pages_manage_posts,pages_manage_engagement,business_management';
+  const fbAppKey = (salt) => crypto.createHash('sha256').update('tng-fb|' + settings.get('sheetId') + '|' + salt).digest();
+  function sealSecret(secret) {
+    const salt = crypto.randomBytes(16).toString('hex'), iv = crypto.randomBytes(12);
+    const c = crypto.createCipheriv('aes-256-gcm', fbAppKey(salt), iv);
+    const ct = Buffer.concat([c.update(String(secret), 'utf8'), c.final()]);
+    return salt + '.' + Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64');
+  }
+  function openSecret(s) {
+    const parts = String(s || '').split('.');
+    if (parts.length !== 2) throw new Error('bad');
+    const b = Buffer.from(parts[1], 'base64');
+    const d = crypto.createDecipheriv('aes-256-gcm', fbAppKey(parts[0]), b.subarray(0, 12));
+    d.setAuthTag(b.subarray(12, 28));
+    return Buffer.concat([d.update(b.subarray(28)), d.final()]).toString('utf8');
+  }
+  function fbAppOf(cfg) { const j = parseJson(cfg && cfg.fbApp && cfg.fbApp.value, null); return j && j.appId && j.s ? j : null; }
+  const myFbOf = () => (fbSecret().my || {})[settings.get('sheetId')] || null;
 
   /* ---------------- người dùng ---------------- */
   async function me() {
@@ -580,7 +601,8 @@ module.exports = function createCore(deps) {
     const sheetId = settings.get('sheetId');
     return {
       me: m,
-      users: data.users.map((u) => ({ email: u.email, name: u.name, role: u.role, active: u.active, addedAt: u.addedAt, perms: m.isLeader ? normPerms(u) : undefined, job: u.job, mode: u.mode, canReview: u.role === ROLE.LEADER || u.canReview, kpi: u.kpi, tab: u.tab, leftAt: u.leftAt, locked: u.locked })),
+      users: data.users.map((u) => ({ email: u.email, name: u.name, role: u.role, active: u.active, addedAt: u.addedAt, perms: m.isLeader ? normPerms(u) : undefined, job: u.job, mode: u.mode, canReview: u.role === ROLE.LEADER || u.canReview, kpi: u.kpi, tab: u.tab, leftAt: u.leftAt, locked: u.locked,
+        fb: m.isLeader ? parseJson(data.cfg['fbMine:' + u.email] && data.cfg['fbMine:' + u.email].value, null) : undefined })),
       pages: data.pages.filter((p) => m.isLeader || !m.pagePerms || m.pagePerms[p.id]).map((p) => ({ id: p.id, name: p.name, enabled: m.pagePerms && !m.isLeader ? canWritePage(m, p.id) : p.enabled, hasToken: !!sec.pages[p.id], updatedAt: p.updatedAt, myPerms: m.isLeader ? ['write', 'reply', 'stats'] : (m.pagePerms ? (m.pagePerms[p.id] || []) : ['write']) })),
       options: { goals: OPTIONS.goals, formats: OPTIONS.formats, manualFormats: OPTIONS.manualFormats, topics: OPTIONS.topics.map((t) => Object.assign({ name: t }, tmap[t] || {})), tags: data.tags, statuses: ST, statusList: STATUSES },
       posts: data.posts.map(clean),
@@ -595,6 +617,11 @@ module.exports = function createCore(deps) {
         maxUploadMb: 20,
         maxBigUploadMb: 10240,
         thisMachineCanPost: Object.keys(sec.pages).length > 0,
+        /* 2.1: nhân viên tự kết nối Facebook */
+        fbShare: fbAppOf(data.cfg) ? { appId: fbAppOf(data.cfg).appId, at: fbAppOf(data.cfg).at || '' } : null,
+        fbScopes: FB_SCOPES,
+        fbLeaderReady: m.isLeader ? !!(sec.appId && sec.appSecret) : undefined,
+        myFb: myFbOf() ? { nick: myFbOf().name || '', at: myFbOf().at || '', pages: myFbOf().pages || [] } : null,
         ads: null
       },
       now: fmt(new Date())
@@ -658,8 +685,34 @@ module.exports = function createCore(deps) {
     p.updatedAt = fmt(new Date());
     await store.writePost(p);
     log(m, self ? 'Đưa vào hàng chờ đăng' : 'Gửi duyệt', id, '');
+    /* 2.1: nhân viên "Tự đăng" đã kết nối Facebook trên máy này → gửi lên Facebook luôn (hẹn giờ của Facebook), không chờ máy leader.
+       Leader giữ như cũ (hàng chờ / bấm Đăng ngay). */
+    if (self && au.role !== ROLE.LEADER && p.authorEmail === m.email) {
+      const r = await autoPublish(m, p);
+      if (r.out) return r.out;
+      if (r.why === 'token') return Object.assign(clean(p), { autoNote: myFbOf() ? 'Nick Facebook của bạn chưa có quyền đăng mọi Page của bài nên bài vào hàng chờ, máy leader đăng.' : 'Bài vào hàng chờ, máy leader đăng. Kết nối Facebook ở Cài đặt › Tài khoản của tôi để tự đăng từ máy này.' });
+      if (r.note) return Object.assign(clean(p), { autoNote: r.note });
+    }
     return clean(p);
   };
+  /** Bài Đã duyệt + máy này có token mọi Page (và người bấm được viết các Page đó) → gửi Facebook ngay:
+      hẹn giờ của Facebook (Facebook tự đăng, tắt máy vẫn lên), còn dưới 10 phút thì đăng ngay. Trả { out } hoặc { why, note }. */
+  async function autoPublish(m, p, extra) {
+    extra = extra || '';
+    const mode = p.publishMode || 'schedule';
+    if (mode === 'manual' || OPTIONS.manualFormats.indexOf(p.format) >= 0) return { why: 'manual' };
+    if (!canPostHere(p) || !pageIds(p).every((pid) => canWritePage(m, pid))) return { why: 'token' };
+    let use = mode, note = '';
+    if (mode === 'schedule') {
+      try {
+        const diff = (parseThaiTime(p.date, p.time).getTime() - Date.now()) / 60000;
+        if (diff < 10) { use = 'now'; note = 'Giờ hẹn đã qua hoặc còn dưới 10 phút nên app đăng ngay.'; }
+        if (diff > 30 * 24 * 60) return { why: 'far', note: 'Giờ hẹn quá 30 ngày nên chưa hẹn được, bài để ở trạng thái Đã duyệt.' };
+      } catch (e) { return { why: 'time', note: String(e.message || e) }; }
+    }
+    try { const out = await publishCore(m, p.id, use); out.autoNote = (note + ' ' + extra).trim(); return { out }; }
+    catch (e) { return { out: Object.assign(clean(await find(p.id)), { autoNote: 'Đã vào hàng chờ nhưng chưa tự đăng được: ' + (e.message || e) }) }; }
+  }
 
   /* ---------------- 2.0 · E. Duyệt & đăng: phiếu duyệt, hậu kiểm, hàng chờ ---------------- */
   function requireReviewer(m) { requireActive(m); if (!m.canReview) throw new Error('Bạn không có quyền duyệt. Bài đang chờ leader hoặc người soát tiếng Thái.'); return m; }
@@ -697,19 +750,12 @@ module.exports = function createCore(deps) {
     await store.writePost(p);
     log(m, 'Duyệt', id, (p.score ? p.score + '/10 · ' : '') + (p.review || ''));
     const down = p.score ? await maybeDowngrade(m, p) : '';
-    const mode = p.publishMode || 'schedule'; // giống khung soạn bài và hàng chờ
-    if (mode === 'manual' || OPTIONS.manualFormats.indexOf(p.format) >= 0) return Object.assign(clean(p), { autoNote: down });
-    if (!m.isLeader || !canPostHere(p)) return Object.assign(clean(p), { autoNote: ('Bài vào hàng chờ, app của leader tự đăng theo lịch. ' + down).trim() });
-    let use = mode, note = '';
-    if (mode === 'schedule') {
-      try {
-        const diff = (parseThaiTime(p.date, p.time).getTime() - Date.now()) / 60000;
-        if (diff < 10) { use = 'now'; note = 'Giờ hẹn đã qua hoặc còn dưới 10 phút nên app đăng ngay.'; }
-        if (diff > 30 * 24 * 60) return Object.assign(clean(p), { autoNote: 'Giờ hẹn quá 30 ngày nên chưa hẹn được, bài để ở trạng thái Đã duyệt.' });
-      } catch (e) { return Object.assign(clean(p), { autoNote: String(e.message || e) }); }
-    }
-    try { const out = await publishCore(m, id, use); out.autoNote = (note + ' ' + down).trim(); return out; }
-    catch (e) { return Object.assign(clean(await find(id)), { autoNote: 'Duyệt xong nhưng chưa tự đăng được: ' + (e.message || e) }); }
+    // 2.1: người duyệt nào có kết nối Facebook cho mọi Page của bài (leader, quản lý) → gửi Facebook luôn; không thì hàng chờ (máy người viết / leader)
+    const r = await autoPublish(m, p, down);
+    if (r.out) return r.out;
+    if (r.why === 'manual') return Object.assign(clean(p), { autoNote: down });
+    if (r.why === 'token') return Object.assign(clean(p), { autoNote: ('Bài vào hàng chờ: máy có kết nối Facebook (người viết hoặc leader) tự đăng theo lịch khi mở app. ' + down).trim() });
+    return Object.assign(clean(p), { autoNote: (r.note + ' ' + down).trim() });
   };
 
   api.api_return = async function (id, opts) {
@@ -780,7 +826,7 @@ module.exports = function createCore(deps) {
     let locked = false;
     try {
       const m = await me();
-      if (!m.isLeader) return;
+      if (!m.active) return; // 2.1: mọi máy có kết nối Facebook đều chạy hàng chờ (máy nhân viên: chỉ Page người đó được viết)
       const pre = await store.load(true);
       if (!pre.posts.some((p) => p.status === ST.APPROVED && canPostHere(p))) return; // không có gì để đăng: khỏi khóa
       if (!(locked = await takeQueueLock())) return; // máy khác đang chạy hàng chờ
@@ -789,7 +835,7 @@ module.exports = function createCore(deps) {
       const now = Date.now();
       const count = {}; // Page|ngày → số bài đã đăng / hẹn
       data.posts.filter((p) => [ST.POSTED, ST.SCHEDULED].indexOf(p.status) >= 0).forEach((p) => pageIds(p).forEach((pid) => { const k = pid + '|' + p.date; count[k] = (count[k] || 0) + 1; }));
-      const queue = data.posts.filter((p) => p.status === ST.APPROVED && ['schedule', 'now'].indexOf(p.publishMode || 'schedule') >= 0 && OPTIONS.manualFormats.indexOf(p.format) < 0 && canPostHere(p) && !BUSY.has(bkey(p.id)))
+      const queue = data.posts.filter((p) => p.status === ST.APPROVED && ['schedule', 'now'].indexOf(p.publishMode || 'schedule') >= 0 && OPTIONS.manualFormats.indexOf(p.format) < 0 && canPostHere(p) && !BUSY.has(bkey(p.id)) && (m.isLeader || pageIds(p).every((pid) => canWritePage(m, pid))))
         .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
       for (const p of queue) {
         let when = 0;
@@ -1126,10 +1172,81 @@ module.exports = function createCore(deps) {
     if (!list.length) throw new Error('Tài khoản này không quản lý Page nào, hoặc token thiếu quyền pages_show_list.');
     const pages = Object.assign({}, sec.pages);
     list.forEach((p) => { pages[String(p.id)] = p.access_token; });
-    setFbSecret({ appId, appSecret, userToken: ex.access_token, connectedAt: fmt(new Date()), pages });
+    setFbSecret({ appId, appSecret, userToken: ex.access_token, connectedAt: fmt(new Date()), pages, manual: list.map((p) => String(p.id)), my: sec.my });
     await store.upsertPages(list.map((p) => ({ id: String(p.id), name: p.name })), fmt(new Date()));
     log(m, 'Kết nối Facebook', '', list.length + ' Page');
+    // đang cho nhân viên tự kết nối mà leader đổi app / App Secret → cập nhật bản mã hóa trong Sheet
+    const shared = fbAppOf((await store.load(true)).cfg);
+    if (shared) { let old = ''; try { old = openSecret(shared.s); } catch (e) { old = ''; } if (shared.appId !== appId || old !== appSecret) await store.setCfg('fbApp', JSON.stringify({ appId, s: sealSecret(appSecret), by: m.email, at: fmt(new Date()) })); }
     return (await api.api_bootstrap()).pages;
+  };
+
+  /* ---------------- 2.1 · nhân viên tự kết nối Facebook ---------------- */
+  /** Leader bật/tắt: cho máy nhân viên dùng app Meta của dự án để tự lấy token Page bằng nick của họ. */
+  api.api_fbShare = async function (on) {
+    const m = requireLeader(await me());
+    if (!on) { await store.setCfg('fbApp', ''); log(m, 'Tắt nhân viên tự kết nối Facebook', '', ''); return { on: false }; }
+    const sec = fbSecret();
+    if (!sec.appId || !sec.appSecret) throw new Error('Máy này chưa kết nối Facebook (App ID + App Secret). Kết nối Facebook ở mục này trước rồi bật.');
+    await store.setCfg('fbApp', JSON.stringify({ appId: sec.appId, s: sealSecret(sec.appSecret), by: m.email, at: fmt(new Date()) }));
+    log(m, 'Cho nhân viên tự kết nối Facebook', '', 'App ' + sec.appId);
+    return { on: true, appId: sec.appId };
+  };
+  /** Page của dự án mà người này được viết (để so với Page nick Facebook của họ có quyền). */
+  function writablePages(m, data) { return data.pages.filter((p) => (m.pagePerms ? canWritePage(m, p.id) : (m.isLeader || p.enabled !== false))).map((p) => String(p.id)); }
+  function myFbInfo(m, data) {
+    const r = myFbOf();
+    const want = writablePages(m, data);
+    if (!r) return { connected: false, want: want };
+    return { connected: true, nick: r.name || '', at: r.at || '', pages: r.pages || [], want: want, missing: want.filter((id) => (r.pages || []).indexOf(id) < 0) };
+  }
+  async function myFbApply(m, longToken, appId) {
+    const who = await fb.call('get', '/me', { fields: 'id,name' }, longToken).catch(() => ({}));
+    const list = await fb.all('/me/accounts', { fields: 'id,name,access_token', limit: 100 }, longToken);
+    const data = await store.load(true);
+    const sid = settings.get('sheetId');
+    const want = writablePages(m, data);
+    const ok = list.filter((p) => want.indexOf(String(p.id)) >= 0 && p.access_token);
+    const sec = fbSecret();
+    const pages = Object.assign({}, sec.pages), my = Object.assign({}, sec.my || {}), manual = sec.manual || [];
+    ((my[sid] && my[sid].pages) || []).forEach((id) => { if (!ok.some((p) => String(p.id) === id) && manual.indexOf(id) < 0) delete pages[id]; }); // nick mất quyền Page nào → bỏ token Page đó
+    ok.forEach((p) => { pages[String(p.id)] = p.access_token; });
+    my[sid] = { id: who.id || '', name: who.name || '', at: fmt(new Date()), pages: ok.map((p) => String(p.id)), userToken: longToken, appId: appId };
+    setFbSecret(Object.assign({}, sec, { pages: pages, my: my }));
+    await store.setCfg('fbMine:' + m.email, JSON.stringify({ nick: who.name || '', pages: my[sid].pages, at: my[sid].at }));
+    log(m, 'Kết nối Facebook của tôi', '', (who.name || '') + ' · ' + ok.length + '/' + want.length + ' Page');
+    return myFbInfo(m, data);
+  }
+  /** Nhân viên: userToken từ cửa sổ đăng nhập Facebook của app (hoặc dán tay) → token dài hạn → token các Page nick có quyền. */
+  api.api_myFbConnect = async function (userToken) {
+    const m = requireActive(await me());
+    userToken = String(userToken || '').trim();
+    if (!userToken) throw new Error('Chưa nhận được đăng nhập Facebook. Bấm "Kết nối Facebook của tôi" lại.');
+    const app = fbAppOf((await store.load(true)).cfg);
+    if (!app) throw new Error('Leader chưa bật "Cho nhân viên tự kết nối Facebook" (Cài đặt → Kết nối tài khoản).');
+    let secret = '';
+    try { secret = openSecret(app.s); } catch (e) { throw new Error('Không mở được thông tin app Meta trong Sheet. Nhờ leader tắt rồi bật lại "Cho nhân viên tự kết nối Facebook".'); }
+    const ex = await fb.call('get', '/oauth/access_token', { grant_type: 'fb_exchange_token', client_id: app.appId, client_secret: secret, fb_exchange_token: userToken }, null);
+    return myFbApply(m, ex.access_token, app.appId);
+  };
+  /** Đọc lại Page nick có quyền (leader vừa cấp / gỡ quyền trong BM), không phải đăng nhập lại. */
+  api.api_myFbRecheck = async function () {
+    const m = requireActive(await me());
+    const r = myFbOf();
+    if (!r || !r.userToken) throw new Error('Máy này chưa kết nối Facebook của bạn.');
+    try { return await myFbApply(m, r.userToken, r.appId); }
+    catch (e) { if (/OAuth|token|190/i.test(String(e.message))) throw new Error('Phiên Facebook đã hết hạn hoặc bị gỡ quyền. Bấm "Kết nối Facebook của tôi" để đăng nhập lại.'); throw e; }
+  };
+  api.api_myFbStatus = async function () { const m = requireActive(await me()); return myFbInfo(m, await store.load(true)); };
+  api.api_myFbOff = async function () {
+    const m = requireActive(await me());
+    const sid = settings.get('sheetId'), sec = fbSecret(), my = Object.assign({}, sec.my || {}), pages = Object.assign({}, sec.pages), manual = sec.manual || [];
+    ((my[sid] && my[sid].pages) || []).forEach((id) => { if (manual.indexOf(id) < 0) delete pages[id]; });
+    delete my[sid];
+    setFbSecret(Object.assign({}, sec, { pages: pages, my: my }));
+    await store.setCfg('fbMine:' + m.email, '');
+    log(m, 'Ngắt Facebook của tôi', '', '');
+    return { connected: false };
   };
 
   api.api_testPages = async function () {
@@ -1233,7 +1350,7 @@ module.exports = function createCore(deps) {
     running = true;
     try {
       const m = await me();
-      if (!m.isLeader) return;
+      if (!m.active) return; // 2.1: máy nhân viên đã kết nối Facebook cũng gửi bình luận hẹn giờ cho Page có token
       const posts = (await store.load(true)).posts;
       await refreshScheduled(posts);
       const now = Date.now();
@@ -1259,7 +1376,7 @@ module.exports = function createCore(deps) {
           q.fbPosts = JSON.stringify(qd); await store.writePost(q);
         }
       }
-      for (const p0 of posts) {
+      for (const p0 of (m.isLeader ? posts : [])) { // kênh khác (Instagram/Threads/TikTok) dùng kết nối của máy leader
         const cp = parseJson(p0.channelPosts);
         if (!cp.pending || cp.pending * 1000 > now || [ST.SCHEDULED, ST.POSTED].indexOf(p0.status) < 0) continue;
         let files = [];
@@ -1569,6 +1686,8 @@ module.exports = function createCore(deps) {
   /** 5 phút/lần trên máy leader: bình luận hẹn giờ + hàng chờ đăng (2.0) */
   async function processAll() { await pscOnly(); await processQueue(); }
   api.api_processQueue = async function () { requireLeader(await me()); await processQueue(); return (await store.load(true)).posts.map(clean); };
+  /** 2.1: chạy hàng chờ ngay trên máy này (mọi người đã kết nối Facebook; máy nhân viên chỉ Page người đó được viết). */
+  api.api_runQueue = async function () { requireActive(await me()); await processQueue(); return (await store.load(true)).posts.map(clean); };
   return { api, me, processScheduledComments: processAll, metaOf, csv, inviteCode };
 };
 
@@ -3385,6 +3504,7 @@ window.hc = {
       return { ok: false, error: e.message || String(e) };
     }
   },
+  fbLogin: () => Promise.resolve({ ok: false, error: 'Kết nối Facebook chỉ làm được trên app TNG Plus máy tính (Windows / Mac).' }),
   pathFor: (file) => { if (!(file instanceof Blob)) return ''; const k = 'webfile:' + (++fileSeq); FILES.set(k, file); return k; },
   upload: upload,
   setup: {
